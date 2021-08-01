@@ -44,8 +44,8 @@ $create_pmt_table_query = "CREATE TABLE $pmt_table_name (
   was_paid BOOLEAN DEFAULT false,
   PRIMARY KEY (id),
   UNIQUE KEY ".$pmt_table_name."_pmt_hash_key (pmt_hash),
-  INDEX( wp_users_id ),
-  INDEX( ext_id )
+  KEY ".$pmt_table_name."_wp_users_id_key ( wp_users_id ),
+  KEY ".$pmt_table_name."_wp_ext_id_key ( ext_id )
 ) $charset_collate;";
 
 $create_contentid_table_query = "CREATE TABLE $contentid_table_name (
@@ -65,10 +65,12 @@ $update_payment_info_query  = "UPDATE `$pmt_table_name` SET pmt_hash=%s, invoice
 $mark_payment_as_paid_query = "UPDATE `$pmt_table_name` SET was_paid=true WHERE pmt_hash=%s";
 $select_userid_extid_contentid_by_pmthash_query = "SELECT wp_users_id, ext_id, content_id FROM `$pmt_table_name` WHERE pmt_hash=%d";
 $delete_unpaid_payments_for_content_and_user_query = "DELETE FROM `$pmt_table_name` WHERE was_paid=false AND content_id=%s AND ( wp_users_id=%d OR ext_id=%s )";
-$select_payment_info_by_content_and_user_id_or_ext_id_query = "SELECT id, pmt_hash, invoice, was_paid, expires_at < now() as is_expired FROM `$pmt_table_name` WHERE content_id=%s AND ( wp_users_id=%d OR ext_id=%s ) ORDER BY created_at DESC";
+$select_payment_info_by_content_and_user_id_or_ext_id_query = "SELECT id, pmt_hash, invoice, was_paid, expires_at < now() as is_expired FROM `$pmt_table_name` WHERE content_id=%s AND ( wp_users_id=%d OR ext_id=%s )";
+$select_unpaid_pmthashes = "SELECT id, pmt_hash FROM `$pmt_table_name` WHERE NOT was_paid";
+
 
 $insert_contentid_query = "INSERT INTO `$contentid_table_name` (content_id, unique_identifier, price) VALUES (%s, %s, %d) ON DUPLICATE KEY UPDATE modified_at=now(), price=%d";
-$count_contentid_query = "SELECT content_id, price FROM `$contentid_table_name` WHERE content_id=%s";
+$select_content_query = "SELECT content_id, price FROM `$contentid_table_name` WHERE content_id=%s";
 
 function ptrm_install() {
 	global $ptrm_db_version;
@@ -95,6 +97,51 @@ function ptrm_update_db_check() {
 }
 
 add_action( 'plugins_loaded', 'ptrm_update_db_check' );
+
+// add 5 seconds interval to cron schedules
+add_filter( 'cron_schedules', 'ptrm_addCronIntervals' );
+
+function ptrm_addCronIntervals( $schedules ) {
+   $schedules['5seconds'] = array( // Provide the programmatic name to be used in code
+      'interval' => 5, // Intervals are listed in seconds
+      'display' => __('Every 5 Seconds') // Easy to read display name
+   );
+   return $schedules; // Do not forget to give back the list of schedules!
+}
+
+add_action( 'ptrm_checkInvoicesInLnbits_hook', 'cron_checkInvoicesInLnbits' );
+
+if( !wp_next_scheduled( 'ptrm_checkInvoicesInLnbits_hook' ) ) {
+  error_log( "scheduleing cron");
+  wp_schedule_event( time(), '5seconds', 'ptrm_checkInvoicesInLnbits_hook' );
+}
+
+function cron_checkInvoicesInLnbits() {
+  $unpaidPaymentHashes = getUnpaidPaymentHashes();
+
+  if( count($unpaidPaymentHashes) == 0 ) {
+    return;
+  }
+
+  foreach ($unpaidPaymentHashes as $unpaidPaymentHash) {
+    $resp = wp_remote_get(
+      get_option( 'lnbits_url ') . '/api/v1/payments/' . $unpaidPaymentHash->pmt_hash,
+      array(
+        'headers' => array(
+          'X-Api-Key' => get_option( 'lnbits_api_key' )
+        )
+      )
+    );
+    $body = json_decode( $resp["body"] );
+
+    if( $body->paid ) {
+      markPaymentAsPaid( $unpaidPaymentHash->pmt_hash );
+      deleteObsoletePayments( $unpaidPaymentHash->pmt_hash );
+    }
+
+  }
+
+}
 
 // http://localhost/?rest_route=/ptrm/v1/paid
 function setup_rest() {
@@ -128,6 +175,8 @@ function rest_markInvoiceAsPaid(WP_REST_Request $request) {
   // get payment hash from $params and mark it as paid.
   // the rest should be resolved by the client querying the paid/<content_id>
   // end point till it returns { "paid": true }
+
+  error_log( json_encode( $params));
 
   if( !isset( $params['payment_hash'] ) ) {
     return new WP_REST_Response( array(), 404 );
@@ -242,10 +291,10 @@ function rest_invoiceForContent(WP_REST_Request $request) {
 add_action( 'rest_api_init', 'setup_rest' );
 
 function getContent( $content_id ) {
-  global $count_contentid_query;
+  global $select_content_query;
   global $wpdb;
   return $wpdb->get_row(
-    $wpdb->prepare($count_contentid_query, array( $content_id ) )
+    $wpdb->prepare($select_content_query, array( $content_id ) )
   );
 }
 
@@ -263,6 +312,12 @@ function getPaymentInfosByContentIdAndUserIdOrExtId( $content_id, $user_id, $ext
   return $wpdb->get_results(
     $wpdb->prepare($select_payment_info_by_content_and_user_id_or_ext_id_query, array( $content_id, $user_id, $ext_id ) )
   );
+}
+
+function getUnpaidPaymentHashes() {
+  global $select_unpaid_pmthashes;
+  global $wpdb;
+  return $wpdb->get_results($select_unpaid_pmthashes);
 }
 
 function insertPaymentInfo( $user_id, $ext_id, $content_id, $pmthash, $invoice, $expiryInMinutes ) {
@@ -343,7 +398,7 @@ function requestInvoiceFromLnbits( $amount, $memo ) {
       'out' => false,
       'amount' => $amount,
       'memo' => $memo,
-      'webhhook' => get_site_url() . '?rest_route=/ptrm/v1/paid',
+      'webhhook' => get_site_url() . '/?rest_route=/ptrm/v1/paid',
     ), JSON_NUMERIC_CHECK),
     'data_format' => 'body'
   ));
